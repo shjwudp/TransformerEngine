@@ -631,6 +631,7 @@ class _Linear(torch.autograd.Function):
             None,  # fp8_calibration
             None,  # fp8_meta
             None,  # fuse_wgrad_accumulation
+            None,  # force_overwrite_wgrad_into_param_main_grad
             None,  # cpu_offloading
             None,  # tp_group
             None,  # tp_size
