@@ -663,33 +663,34 @@ class _LayerNormLinear(torch.autograd.Function):
             None,
             None,
             grad_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # use_bias
+            None,  # eps
+            None,  # is_first_microbatch
+            None,  # fp8
+            None,  # fp8_calibration
+            None,  # fp8_meta
+            None,  # fuse_wgrad_accumulation
+            None,  # force_overwrite_wgrad_into_param_main_grad
+            None,  # cpu_offloading
+            None,  # tp_group
+            None,  # tp_size
+            None,  # sequence_parallel
+            None,  # tensor_parallel
+            None,  # activation_dtype
+            None,  # parallel_mode
+            None,  # return_layernorm_output
+            None,  # return_layernorm_output_gathered
+            None,  # is_grad_enabled
+            None,  # fwd_ln_sm_margin
+            None,  # bwd_ln_sm_margin
+            None,  # zero_centered_gamma
+            None,  # normalization
+            None,  # ub_bulk_wgrad
+            None,  # ub_bulk_dgrad
+            None,  # ub_overlap_rs_dgrad
+            None,  # ub_overlap_ag
+            None,  # ub_name
+            None,  # fsdp_group
         )
 
 

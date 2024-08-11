@@ -528,24 +528,25 @@ class _Linear(torch.autograd.Function):
             None,
             dgrad.view(ctx.inp_shape) if ctx.requires_dgrad else None,
             grad_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # use_bias
+            None,  # is_first_microbatch
+            None,  # fp8
+            None,  # fp8_calibration
+            None,  # fp8_meta
+            None,  # fuse_wgrad_accumulation
+            None,  # force_overwrite_wgrad_into_param_main_grad
+            None,  # cpu_offloading
+            None,  # tp_group
+            None,  # tp_size
+            None,  # sequence_parallel
+            None,  # tensor_parallel
+            None,  # activation_dtype
+            None,  # parallel_mode
+            None,  # is_grad_enabled
+            None,  # primary_weights_in_fp8
+            None,  # ub_overlap_rs
+            None,  # ub_overlap_ag
+            None,  # ub_name
         )
 
 
