@@ -69,6 +69,7 @@ class _LayerNormLinear(torch.autograd.Function):
         fp8_calibration: bool,
         fp8_meta: Dict[str, Any],
         fuse_wgrad_accumulation: bool,
+        force_overwrite_wgrad_into_param_main_grad: bool,
         cpu_offloading: bool,
         tp_group: Union[dist_group_type, None],
         tp_size: int,
@@ -301,6 +302,7 @@ class _LayerNormLinear(torch.autograd.Function):
             ctx.fp8 = fp8
             ctx.fp8_meta = fp8_meta
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.force_overwrite_wgrad_into_param_main_grad = force_overwrite_wgrad_into_param_main_grad
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
             ctx.use_bias = use_bias
@@ -411,7 +413,9 @@ class _LayerNormLinear(torch.autograd.Function):
                 ln_out_total = ln_out
                 handle = None
 
-            if ctx.is_first_microbatch is not None:
+            if ctx.force_overwrite_wgrad_into_param_main_grad:
+                accumulate_wgrad_into_param_main_grad = False
+            elif ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
                     ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
                 )
@@ -782,6 +786,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         eps: float = 1e-5,
         sequence_parallel: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        force_overwrite_wgrad_into_param_main_grad: bool = False,
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         get_rng_state_tracker: Optional[Callable] = None,
@@ -808,6 +813,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         self.in_features = in_features
         self.out_features = out_features
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self.force_overwrite_wgrad_into_param_main_grad = force_overwrite_wgrad_into_param_main_grad
         self.normalization = normalization
         assert normalization in ['LayerNorm', 'RMSNorm'], "Unsupported normalization type!"
         self.use_bias = bias
@@ -1136,6 +1142,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 self.fp8_calibration,
                 self.fp8_meta,
                 self.fuse_wgrad_accumulation,
+                self.force_overwrite_wgrad_into_param_main_grad,
                 CPUOffloadEnabled,
                 self.tp_group,
                 self.tp_size,
