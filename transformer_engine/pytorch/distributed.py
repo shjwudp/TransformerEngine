@@ -5,15 +5,19 @@
 """Methods needed for distributed training (DP/TP)."""
 import warnings
 from contextlib import contextmanager, AbstractContextManager, ContextDecorator
-from typing import Any, Dict, Union, Optional, Callable, Tuple
+from typing import Any, Dict, Union, Optional, Callable, Tuple, List
 
 import torch
-from torch.cuda import _lazy_call
+from torch.cuda import _lazy_call, _lazy_init
 from torch.utils.checkpoint import detach_variable, noop_context_fn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp._common_utils import _get_module_fsdp_state
+from torch.distributed.fsdp._traversal_utils import _get_fsdp_states_with_modules
 
 from .utils import safely_set_viewless_tensor_data
 from .constants import dist_group_type
 from .fp8 import FP8GlobalStateManager
+from .float8_tensor import Float8Tensor
 
 
 __all__ = ["checkpoint", "CudaRNGStatesTracker"]
@@ -31,15 +35,62 @@ _FP8_ACTIVATION_RECOMPUTE_ENABLED = False
 _FP8_ACTIVATION_RECOMPUTE_PHASE = False
 
 
-def _set_cuda_rng_state(new_state: torch.Tensor, device: Union[int, str] = -1) -> None:
-    """Sets the random number generator state of the current GPU.
+_ALL_ACTIVE_RNG_STATES = {}
 
-    Arguments:
-        new_state (torch.ByteTensor): The desired state
-    This function is adapted from PyTorch repo (torch.cuda.set_rng_state)
-    with a single change: the input state is not cloned. Cloning caused
-    major performance issues for +4 GPU cases.
-    """
+
+def get_all_rng_states() -> bool:
+    """Returns all generator states used by `CudaRNGStatesTracker`."""
+    return _ALL_ACTIVE_RNG_STATES
+
+
+def set_all_rng_states(states: List) -> None:
+    """Updates all generator states used by `CudaRNGStatesTracker`."""
+    global _ALL_ACTIVE_RNG_STATES
+    _ALL_ACTIVE_RNG_STATES = states
+
+
+def graph_safe_rng_available() -> bool:
+    """Returns whether cuda graph safe RNG state manipulation is supported."""
+    return (
+        hasattr(torch.cuda.CUDAGraph, "register_generator_state")
+        and hasattr(torch.Generator, "graphsafe_set_state")
+        and hasattr(torch.Generator, "graphsafe_get_state")
+        and hasattr(torch.Generator, "clone_state")
+    )
+
+
+def _get_cuda_rng_state(
+    device: Union[int, str, torch.device] = "cuda",
+    clone: bool = False,
+    graph_safe: bool = True,
+) -> torch.Tensor:
+    """Return the random number generator state of the specified GPU."""
+
+    _lazy_init()
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    idx = device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    default_generator = torch.cuda.default_generators[idx]
+    if graph_safe_rng_available() and graph_safe:
+        if clone:
+            # Reference to the cloned generator state
+            return default_generator.clone_state()
+        # Reference to the current generator state
+        return default_generator.graphsafe_get_state()
+    return default_generator.get_state()
+
+
+def _set_cuda_rng_state(
+    new_state: torch.Tensor,
+    device: Union[int, str] = -1,
+    graph_safe=True,
+) -> None:
+    """Sets the random number generator state of the current GPU."""
+
     if device == -1:
         device = torch.device("cuda")
     elif isinstance(device, str):
@@ -52,6 +103,9 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: Union[int, str] = -1) -
         if idx is None:
             idx = torch.cuda.current_device()
         default_generator = torch.cuda.default_generators[idx]
+        if graph_safe_rng_available() and graph_safe:
+            default_generator.graphsafe_set_state(new_state)
+            return
         default_generator.set_state(new_state)
 
     _lazy_call(cb)
@@ -125,9 +179,7 @@ def split_tensor_into_1d_equal_chunks(
     return data
 
 
-def gather_split_1d_tensor(
-    tensor: torch.Tensor, tp_group: dist_group_type
-) -> torch.Tensor:
+def gather_split_1d_tensor(tensor: torch.Tensor, tp_group: dist_group_type) -> torch.Tensor:
     """Opposite of above function, gather values from model parallel ranks."""
     numel_gathered = torch.numel(tensor) * get_distributed_world_size(tp_group)
     gathered = torch.empty(
@@ -148,11 +200,8 @@ class activation_recompute_forward(AbstractContextManager, ContextDecorator):
     retrieved, and the forward pass is computed again while tracking the intermediate
     activations, followed by calculation of gradients using these values.
     """
-    def __init__(
-        self,
-        activation_recompute: bool = False,
-        recompute_phase: bool = False
-    ):
+
+    def __init__(self, activation_recompute: bool = False, recompute_phase: bool = False):
         super().__init__()
         self.activation_recompute = activation_recompute
         self.recompute_phase = recompute_phase
@@ -178,6 +227,28 @@ def is_fp8_activation_recompute_enabled() -> bool:
 def in_fp8_activation_recompute_phase() -> bool:
     """Return global boolean"""
     return _FP8_ACTIVATION_RECOMPUTE_PHASE
+
+
+def _get_active_autocast_contexts():
+    """
+    Returns new CPU and GPU torch.amp.autocast(..) contexts that match the active autocast state
+    at the time of this function's execution.
+    """
+    autocast_cached = torch.is_autocast_cache_enabled()
+
+    gpu_autocast_enabled = torch.is_autocast_enabled()
+    gpu_autocast_dtype = torch.get_autocast_gpu_dtype()
+    gpu_autocast_ctx = torch.cuda.amp.autocast(
+        gpu_autocast_enabled, gpu_autocast_dtype, autocast_cached
+    )
+
+    cpu_autocast_enabled = torch.is_autocast_cpu_enabled()
+    cpu_autocast_dtype = torch.get_autocast_cpu_dtype()
+    cpu_autocast_ctx = torch.cpu.amp.autocast(
+        cpu_autocast_enabled, cpu_autocast_dtype, autocast_cached
+    )
+
+    return gpu_autocast_ctx, cpu_autocast_ctx
 
 
 class _CheckpointFunction(torch.autograd.Function):
@@ -206,7 +277,7 @@ class _CheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
+        ctx.fwd_cuda_rng_state = _get_cuda_rng_state(graph_safe=False)
         if get_rng_state_tracker is not None:
             ctx.fwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
 
@@ -214,10 +285,12 @@ class _CheckpointFunction(torch.autograd.Function):
             forward_ctx, recompute_ctx = context_fn()
         else:
             forward_ctx, recompute_ctx = noop_context_fn()
+
+        # Preserve torch autocast context for the backward pass
+        torch_gpu_amp_ctx, torch_cpu_amp_ctx = _get_active_autocast_contexts()
+
         with torch.no_grad(), forward_ctx:
-            with activation_recompute_forward(
-                activation_recompute=True, recompute_phase=False
-            ):
+            with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
                 outputs = run_function(*args, **kwargs)
 
         # Divide hidden states across model parallel group and only keep
@@ -226,9 +299,7 @@ class _CheckpointFunction(torch.autograd.Function):
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
                 args[0],
-                split_tensor_into_1d_equal_chunks(
-                    args[0].data, tp_group, new_buffer=True
-                ),
+                split_tensor_into_1d_equal_chunks(args[0].data, tp_group, new_buffer=True),
             )
 
         # Store everything.
@@ -239,6 +310,8 @@ class _CheckpointFunction(torch.autograd.Function):
         ctx.get_rng_state_tracker = get_rng_state_tracker
         ctx.tp_group = tp_group
         ctx.recompute_ctx = recompute_ctx
+        ctx.torch_gpu_amp_ctx = torch_gpu_amp_ctx
+        ctx.torch_cpu_amp_ctx = torch_cpu_amp_ctx
         ctx.kwargs = kwargs
 
         return outputs
@@ -250,13 +323,11 @@ class _CheckpointFunction(torch.autograd.Function):
         """Call backward function with activation recomputation."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
-                "Checkpointing is not compatible with .grad(), "
-                "please use .backward() if possible"
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
             )
 
         inputs = tuple(
-            t if t is not None else arg
-            for (t, arg) in zip(ctx.saved_tensors, ctx.inputs)
+            t if t is not None else arg for (t, arg) in zip(ctx.saved_tensors, ctx.inputs)
         )
 
         get_rng_state_tracker = ctx.get_rng_state_tracker
@@ -264,34 +335,35 @@ class _CheckpointFunction(torch.autograd.Function):
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0],
-                gather_split_1d_tensor(inputs[0].data, ctx.tp_group).view(
-                    ctx.input_0_shape
-                ),
+                gather_split_1d_tensor(inputs[0].data, ctx.tp_group).view(ctx.input_0_shape),
             )
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = torch.cuda.get_rng_state()
+        bwd_cuda_rng_state = _get_cuda_rng_state(graph_safe=False)
         if get_rng_state_tracker is not None:
             bwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
 
         # Set the states to what it used to be before the forward pass.
         torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        _set_cuda_rng_state(ctx.fwd_cuda_rng_state)
+        _set_cuda_rng_state(ctx.fwd_cuda_rng_state, graph_safe=False)
         if get_rng_state_tracker is not None:
             get_rng_state_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
 
         # Compute the forward pass.
         detached_inputs = detach_variable(inputs)
-        with torch.enable_grad(), ctx.recompute_ctx:
-            with activation_recompute_forward(
-                activation_recompute=True, recompute_phase=True
-            ):
-                outputs = ctx.run_function(*detached_inputs, **ctx.kwargs)
+        with (
+            torch.enable_grad(),
+            ctx.recompute_ctx,
+            ctx.torch_gpu_amp_ctx,
+            ctx.torch_cpu_amp_ctx,
+            activation_recompute_forward(activation_recompute=True, recompute_phase=True),
+        ):
+            outputs = ctx.run_function(*detached_inputs, **ctx.kwargs)
 
         # Set the states back to what it was at the start of this function.
         torch.set_rng_state(bwd_cpu_rng_state)
-        _set_cuda_rng_state(bwd_cuda_rng_state)
+        _set_cuda_rng_state(bwd_cuda_rng_state, graph_safe=False)
         if get_rng_state_tracker is not None:
             get_rng_state_tracker().set_states(bwd_cuda_rng_state_tracker)
 
@@ -306,26 +378,22 @@ class _CheckpointFunction(torch.autograd.Function):
                 args_with_grad.append(args[i])
         if len(outputs_with_grad) == 0:
             raise RuntimeError(
-                "none of output has requires_grad=True,"
-                " this checkpoint() is not necessary"
+                "none of output has requires_grad=True, this checkpoint() is not necessary"
             )
 
         torch.autograd.backward(outputs_with_grad, args_with_grad)
         grads = tuple(
-            inp.grad if isinstance(inp, torch.Tensor) else None
-            for inp in detached_inputs
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs
         )
         return (None, None, None, None, None, None) + grads
+
 
 class _CheckpointFrame:
     """
     Storage frame for forward RNG states and detached activations from the forward recompute.
     """
-    def __init__(
-        self,
-        recompute_fn: Callable,
-        get_rng_state_tracker: Callable
-    ):
+
+    def __init__(self, recompute_fn: Callable, get_rng_state_tracker: Callable):
         self.recompute_fn = recompute_fn
         self.recomputed = []
         self.count = 0
@@ -333,15 +401,14 @@ class _CheckpointFrame:
         self.fwd_rng_states = None
         self.bwd_rng_states = None
 
-
     def cache_rng_states(self, forward=True):
         """Cache fwd/bwd RNG states in the frame to restore later."""
         rng_states = (
             torch.get_rng_state(),
-            torch.cuda.get_rng_state(),
+            _get_cuda_rng_state(graph_safe=False),
         )
         if self.get_rng_state_tracker is not None:
-            rng_states += (self.get_rng_state_tracker().get_states(), )
+            rng_states += (self.get_rng_state_tracker().get_states(),)
 
         if forward:
             self.fwd_rng_states = rng_states
@@ -356,12 +423,14 @@ class _CheckpointFrame:
             rng_states = self.bwd_rng_states
 
         torch.set_rng_state(rng_states[0])
-        _set_cuda_rng_state(rng_states[1])
+        _set_cuda_rng_state(rng_states[1], graph_safe=False)
         if self.get_rng_state_tracker is not None:
             self.get_rng_state_tracker().set_states(rng_states[2])
 
 
-class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):  # pylint: disable=too-few-public-methods
+class _recomputation_hook(
+    torch.autograd.graph.saved_tensors_hooks
+):  # pylint: disable=too-few-public-methods
     """torch.autograd hook for packing/unpacking tensors during the activation recompute phase."""
 
     def __init__(self, frame):
@@ -384,7 +453,9 @@ class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):  # pylint: 
         super().__init__(pack_hook, unpack_hook)
 
 
-class _checkpoint_hook(torch.autograd.graph.saved_tensors_hooks):  # pylint: disable=too-few-public-methods
+class _checkpoint_hook(
+    torch.autograd.graph.saved_tensors_hooks
+):  # pylint: disable=too-few-public-methods
     """torch.autograd hook for packing/unpacking tensors during the checkpointed forward pass."""
 
     def __init__(self, frame, args, kwargs):
@@ -449,15 +520,15 @@ def get_activation_recompute_contexts():
     return forward_ctx, recompute_ctx
 
 
-def _is_te_module(module):
+def has_te_modules(network):
     """
-    Check if given module is a Transformer Engine module that requires the TE checkpoint
-    implementation for activation recompute.
+    Check if there are any Transformer Engine modules in the network.
     """
     from .module import LayerNorm, RMSNorm
     from .module.base import TransformerEngineBaseModule
     from .attention import UnfusedDotProductAttention, DotProductAttention, MultiheadAttention
     from .transformer import TransformerLayer
+
     te_classes_list = [
         LayerNorm,
         RMSNorm,
@@ -467,14 +538,19 @@ def _is_te_module(module):
         MultiheadAttention,
         TransformerLayer,
     ]
-    is_te_module = False
-    for te_class in te_classes_list:
-        if isinstance(module, te_class):
-            is_te_module = True
-            break
-    return is_te_module
+
+    if isinstance(network, torch.nn.Module):
+        for module in network.modules():
+            if any(isinstance(module, te_class) for te_class in te_classes_list):
+                return True
+        return False
+
+    # Cannot check for TE modules inside a custom class/callable that's not a torch.nn.Module,
+    # so just assume that it has TE modules just to be safe.
+    return True
 
 
+@torch._disable_dynamo
 def checkpoint(
     function: Callable,
     *args: Tuple[torch.Tensor, ...],
@@ -524,25 +600,30 @@ def checkpoint(
     get_rng_state_tracker = kwargs.pop("get_rng_state_tracker", None)
 
     # Ensure backward compatibility.
-    if (len(args) > 3 and isinstance(args[0], bool) and callable(args[1])
-        and isinstance(args[2], None | dist_group_type)):
+    if (
+        len(args) > 3
+        and isinstance(args[0], bool)
+        and callable(args[1])
+        and isinstance(args[2], None | dist_group_type)
+    ):
         warnings.warn(
             "Passing non-tensor non-keyword arguments is deprecated and support will be removed in "
             "future releases of TransformerEngine. `distribute_saved_activations`, `tp_group`, and "
             "`get_rng_state_tracker` must be passed as keyword arguments to `checkpoint`.",
-            DeprecationWarning, stacklevel=2,
+            DeprecationWarning,
+            stacklevel=2,
         )
-        distribute_saved_activations, get_rng_state_tracker, tp_group = args[:3] # pylint: disable=unbalanced-tuple-unpacking
+        distribute_saved_activations = args[0]
+        get_rng_state_tracker = args[1]
+        tp_group = args[2]
         args = args[3:]
 
-    # Trigger the native PyTorch checkpoint if:
-    # 1. `function` is a `torch.nn.Module`
-    #    AND
-    # 2. `function` is NOT a TE module
+    # Trigger the native PyTorch checkpoint if the function is not or does not contain a
+    # Transformer Engine module.
     context_fn = kwargs.pop("context_fn", noop_context_fn)
     determinism_check = kwargs.pop("determinism_check", "default")
     debug = kwargs.pop("debug", False)
-    if isinstance(function, torch.nn.Module) and not _is_te_module(function):
+    if not has_te_modules(function):
         return torch.utils.checkpoint.checkpoint(
             function,
             *args,
@@ -550,8 +631,13 @@ def checkpoint(
             context_fn=context_fn,
             determinism_check=determinism_check,
             debug=debug,
-            **kwargs
+            **kwargs,
         )
+
+    # If this TE module is FSDP-wrapped, clear its FSDP group information because there's no need
+    # to scatter/gather activations that we will recompute anyway.
+    setattr(function, "fsdp_wrapped", False)
+    setattr(function, "fsdp_group", None)
 
     # Otherwise discard unused te.utils.checkpoint.checkpoint() arguments
     # and execute TE's own checkpointing
@@ -588,8 +674,17 @@ def checkpoint(
     user_forward_ctx, user_recompute_ctx = context_fn()
     te_forward_ctx, te_recompute_ctx = get_activation_recompute_contexts()
 
+    # Preserve the torch autocast contexts from the forward pass during recompute phase.
+    torch_gpu_amp_forward_ctx, torch_cpu_amp_forward_ctx = _get_active_autocast_contexts()
+
     def recompute_fn(*args, **kwargs):
-        with torch.autograd.enable_grad(), te_recompute_ctx, user_recompute_ctx:
+        with (
+            torch.autograd.enable_grad(),
+            te_recompute_ctx,
+            user_recompute_ctx,
+            torch_gpu_amp_forward_ctx,
+            torch_cpu_amp_forward_ctx,
+        ):
             function(*args, **kwargs)
 
     # Initialize a new checkpoint frame for each new forward pass.
@@ -603,6 +698,7 @@ def checkpoint(
         out = function(*args, **kwargs)
 
     return out
+
 
 class CudaRNGStatesTracker:
     """
@@ -664,13 +760,23 @@ class CudaRNGStatesTracker:
         # Check that state is not already defined.
         if name in self.states_:
             raise Exception(f"cuda rng state {name} already exists")
-        # Get the current rng state.
-        orig_rng_state = torch.cuda.get_rng_state()
-        # Set the new state and store it.
-        torch.cuda.manual_seed(seed)
-        self.states_[name] = torch.cuda.get_rng_state()
-        # Reset rng state to what it was.
-        _set_cuda_rng_state(orig_rng_state)
+
+        if graph_safe_rng_available():
+            new_state = _get_cuda_rng_state(clone=True)
+            new_state.manual_seed(seed)
+            self.states_[name] = new_state
+            # Update global states.
+            set_all_rng_states(self.states_)
+        else:
+            # Get the current rng state.
+            orig_rng_state = _get_cuda_rng_state()
+            # Set the new state and store it.
+            torch.cuda.manual_seed(seed)
+            self.states_[name] = _get_cuda_rng_state(clone=True)
+            # Reset rng state to what it was.
+            _set_cuda_rng_state(orig_rng_state)
+            # Update global states.
+            set_all_rng_states(self.states_)
 
     @contextmanager
     def fork(self, name: str = "model-parallel-rng"):
@@ -684,16 +790,17 @@ class CudaRNGStatesTracker:
         # Check if we have added the state
         if name not in self.states_:
             raise Exception(f"cuda rng state {name} is not added")
-        # Store current rng state.
-        orig_cuda_rng_state = torch.cuda.get_rng_state()
+        # Get the reference to current rng state.
+        orig_cuda_rng_state = _get_cuda_rng_state()
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
         # Do the stuff we wanted to do.
         try:
             yield
         finally:
-            # Update the current rng state for later use.
-            self.states_[name] = torch.cuda.get_rng_state()
+            # this is redundant with graph-safe API
+            if not graph_safe_rng_available():
+                self.states_[name] = _get_cuda_rng_state()
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
 
@@ -714,9 +821,7 @@ def reduce_scatter_along_first_dim(
 
     dim_size[0] = dim_size[0] // world_size
 
-    output = torch.empty(
-        dim_size, dtype=input_.dtype, device=torch.cuda.current_device()
-    )
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
     handle = torch.distributed.reduce_scatter_tensor(
         output, input_.contiguous(), group=tp_group, async_op=async_op
     )
@@ -736,9 +841,7 @@ def gather_along_first_dim(
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(
-        dim_size, dtype=input_.dtype, device=torch.cuda.current_device()
-    )
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
     handle = torch.distributed.all_gather_into_tensor(
         output, input_.contiguous(), group=tp_group, async_op=async_op
     )
@@ -761,3 +864,113 @@ def allreduce(
     handle = torch.distributed.all_reduce(input_, group=tp_group, async_op=async_op)
 
     return input_, handle
+
+
+def _fsdp_scatter_tensors(
+    fsdp_group: dist_group_type,
+    *tensors: torch.Tensor,
+):
+    shapes = []
+    if fsdp_group is not None:
+        for t in tensors:
+            if isinstance(t, torch.Tensor):
+                target = t._data if isinstance(t, Float8Tensor) else t
+                shapes.append(target.data.shape)
+                safely_set_viewless_tensor_data(
+                    target,
+                    split_tensor_into_1d_equal_chunks(target.data, fsdp_group, new_buffer=True),
+                )
+            else:
+                shapes.append(None)
+    return shapes
+
+
+def _fsdp_gather_tensors(
+    fsdp_group: dist_group_type,
+    shapes: List[Tuple[int, ...]],
+    *tensors: torch.Tensor,
+):
+    if fsdp_group is not None:
+        assert len(shapes) == len(tensors), "Number of tensors and tensor shapes must be equal."
+        for s, t in zip(shapes, tensors):
+            if isinstance(t, torch.Tensor):
+                assert s is not None, "Internal TE error."
+                target = t._data if isinstance(t, Float8Tensor) else t
+                safely_set_viewless_tensor_data(
+                    target, gather_split_1d_tensor(target.data, fsdp_group).view(s)
+                )
+
+
+def _is_te_module(module):
+    """
+    Check if given module is a Transformer Engine module that requires the TE checkpoint
+    implementation for activation recompute.
+    """
+    from .module import LayerNorm, RMSNorm
+    from .module.base import TransformerEngineBaseModule
+    from .attention import UnfusedDotProductAttention, DotProductAttention, MultiheadAttention
+    from .transformer import TransformerLayer
+
+    te_classes_list = [
+        LayerNorm,
+        RMSNorm,
+        TransformerEngineBaseModule,
+        UnfusedDotProductAttention,
+        DotProductAttention,
+        MultiheadAttention,
+        TransformerLayer,
+    ]
+    is_te_module = False
+    for te_class in te_classes_list:
+        if isinstance(module, te_class):
+            is_te_module = True
+            break
+    return is_te_module
+
+
+def prepare_te_modules_for_fsdp(fsdp_root: torch.nn.Module) -> None:
+    """
+    Inject FSDP process gorup references into FSDP-wrapped TE modules in an FSDP-wrapped root
+    module in order to scatter/gather the Fp8 weight copies at the same time FSDP scatters/gathers
+    its `FlatParameters`.
+
+    Parameters
+    ----------
+    fsdp_root: torch.nn.Module
+               FSDP-wrapped root module that may contain FSDP-wrapped TE modules.
+    """
+    assert isinstance(fsdp_root, FSDP), "Root module must be FSDP-wrapped."
+
+    # If the root module is a TE module, inject FSDP information into it
+    if _is_te_module(fsdp_root.module):
+        if hasattr(fsdp_root, "primary_weights_in_fp8"):
+            assert not fsdp_root.primary_weights_in_fp8, (
+                "TE modules with primary weights in FP8 cannot be FSDP-wrapped. "
+                "Please initialize your model without the te.fp8_model_init(...) context."
+            )
+        root_state = _get_module_fsdp_state(fsdp_root)
+        assert root_state is not None, "Root module does not have a valid _FSDPState."
+        setattr(fsdp_root.module, "fsdp_group", root_state.process_group)
+
+    # Iterate through all FSDP-wrapped submodules and inject FSDP information into TE modules
+    fsdp_states, fsdp_modules = _get_fsdp_states_with_modules(fsdp_root)
+    for state, fsdp_module in zip(fsdp_states, fsdp_modules):
+        if _is_te_module(fsdp_module.module):
+            if hasattr(fsdp_module.module, "primary_weights_in_fp8"):
+                assert not fsdp_module.module.primary_weights_in_fp8, (
+                    "TE modules with primary weights in FP8 cannot be FSDP-wrapped. "
+                    "Please initialize your model without the te.fp8_model_init(...) context."
+                )
+            setattr(fsdp_module.module, "fsdp_group", state.process_group)
+
+
+class FullyShardedDataParallel(FSDP):
+    """
+    Transformer Engine wrapper around `torch.distributed.fsdp.FullyShardedDataParallel` that
+    extracts necessary information out of the FSDP wrap for TE modules to scatter their
+    activation tensors after each forward pass and gather them before the backward pass.
+    """
+
+    def __init__(self, module, *args, **kwargs):
+        super().__init__(module, *args, **kwargs)
+        prepare_te_modules_for_fsdp(self)

@@ -31,6 +31,7 @@ class _RMSNorm(torch.autograd.Function):
         eps: float,
         fwd_rmsnorm_sm_margin: int,
         bwd_rmsnorm_sm_margin: int,
+        inf_rmsnorm_sm_margin: int,
         zero_centered_gamma: bool,
         is_grad_enabled: bool,
         activation_dtype: torch.dtype,
@@ -46,33 +47,36 @@ class _RMSNorm(torch.autograd.Function):
         rmsnorm_weight = cast_if_needed(rmsnorm_weight, activation_dtype)
 
         if is_grad_enabled:
-            rmsnorm_out, rsigma = tex.rmsnorm_fwd(inputmat, rmsnorm_weight,
-                                                  eps, fwd_rmsnorm_sm_margin,
-                                                  zero_centered_gamma)
+            rmsnorm_out, rsigma = tex.rmsnorm_fwd(
+                inputmat, rmsnorm_weight, eps, fwd_rmsnorm_sm_margin, zero_centered_gamma
+            )
             ctx.save_for_backward(inputmat, rmsnorm_weight, rsigma)
             ctx.inp_shape = inp.shape
             ctx.bwd_rmsnorm_sm_margin = bwd_rmsnorm_sm_margin
             ctx.zero_centered_gamma = zero_centered_gamma
         else:
-            rmsnorm_out = tex.rmsnorm_fwd_inf(inputmat, rmsnorm_weight,
-                                              eps,
-                                              zero_centered_gamma)
+            rmsnorm_out = tex.rmsnorm_fwd_inf(
+                inputmat, rmsnorm_weight, eps, inf_rmsnorm_sm_margin, zero_centered_gamma
+            )
         return rmsnorm_out.view_as(inp)
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         inputmat, rmsnorm_weight, rsigma = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         d_rmsnorm_out = grad_output.view(inputmat.shape)
         dxmat, dgamma = tex.rmsnorm_bwd(
-            d_rmsnorm_out, inputmat, rsigma, rmsnorm_weight,
-            ctx.bwd_rmsnorm_sm_margin, ctx.zero_centered_gamma
+            d_rmsnorm_out,
+            inputmat,
+            rsigma,
+            rmsnorm_weight,
+            ctx.bwd_rmsnorm_sm_margin,
+            ctx.zero_centered_gamma,
         )
         return (
             dxmat.view(ctx.inp_shape),
             dgamma,
+            None,
             None,
             None,
             None,
@@ -143,7 +147,7 @@ class RMSNorm(torch.nn.Module):
         )
         self.sequence_parallel = sequence_parallel
 
-        self.reset_parameters(defer_init=(device == 'meta'))
+        self.reset_parameters(defer_init=(device == "meta"))
 
         # These many SMs are subtracted from the total SM count when calling forward
         # and backward RMSNorm C APIs. These envvars can be used to prevent the LN
@@ -151,14 +155,15 @@ class RMSNorm(torch.nn.Module):
         # communication overlap with RMSNorm.
         self.fwd_rmsnorm_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
         self.bwd_rmsnorm_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
+        self.inf_rmsnorm_sm_margin = int(os.getenv("NVTE_INF_LAYERNORM_SM_MARGIN", "0"))
 
     def reset_rms_norm_parameters(self) -> None:
         """Init RMSNorm params"""
         warnings.warn(
-            ("This method is deprecated and will be removed in an upcoming release. "
-             "Update your code to use RMSNorm.reset_parameters() instead."),
+            "This method is deprecated and will be removed in an upcoming release. "
+            "Update your code to use RMSNorm.reset_parameters() instead.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
         if not self.zero_centered_gamma:
             init.ones_(self.weight)
@@ -170,8 +175,8 @@ class RMSNorm(torch.nn.Module):
         if defer_init:
             return
 
-        if self.weight.device == torch.device('meta'):
-            self.weight = torch.nn.Parameter(torch.empty_like(self.weight, device='cuda'))
+        if self.weight.device == torch.device("meta"):
+            self.weight = torch.nn.Parameter(torch.empty_like(self.weight, device="cuda"))
         init.constant_(self.weight, float(not self.zero_centered_gamma))
         setattr(self.weight, "sequence_parallel", self.sequence_parallel)
 
@@ -195,6 +200,7 @@ class RMSNorm(torch.nn.Module):
             self.eps,
             self.fwd_rmsnorm_sm_margin,
             self.bwd_rmsnorm_sm_margin,
+            self.inf_rmsnorm_sm_margin,
             self.zero_centered_gamma,
             torch.is_grad_enabled(),
             self.activation_dtype,

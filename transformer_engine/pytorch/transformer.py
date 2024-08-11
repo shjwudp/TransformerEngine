@@ -10,7 +10,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
-import transformer_engine_extensions as tex
 from transformer_engine.pytorch.module import LayerNormMLP, LayerNorm, RMSNorm
 from transformer_engine.pytorch.attention import (
     InferenceParams,
@@ -129,7 +128,7 @@ class TransformerLayer(torch.nn.Module):
                This can be used for structures like `T5` Transformer in conjunction with the
                `encoder` option.
     kv_channels: int, default = `None`
-                number of key-value channels. defaults to
+                number of query-key-value channels per attention head. defaults to
                 :attr:`hidden_size` / :attr:`num_attention_heads` if `None`.
     self_attn_mask_type: {'no_mask', 'padding', 'causal', 'padding_causal', 'arbitrary'},
                         default = `causal`
@@ -163,7 +162,7 @@ class TransformerLayer(torch.nn.Module):
           if set to `False`, the transformer layer will not learn any additive biases.
     activation : str, default = 'gelu'
           Type of activation used in MLP block.
-          Options are: 'gelu', 'relu', 'reglu', 'geglu', 'swiglu' and 'qgelu'.
+          Options are: 'gelu', 'relu', 'reglu', 'geglu', 'swiglu', 'qgelu' and 'srelu'.
     device : Union[torch.device, str], default = "cuda"
           The device on which the parameters of the model will allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
@@ -263,17 +262,12 @@ class TransformerLayer(torch.nn.Module):
         ub_overlap_rs: bool = True,
         ub_overlap_rs_dgrad: bool = False,
         bias: bool = True,
-        activation: str = 'gelu',
+        activation: str = "gelu",
         normalization: str = "LayerNorm",
         device: Union[torch.device, str] = "cuda",
         attn_input_format: str = "sbhd",
     ) -> None:
         super().__init__()
-
-        if ub_tp_comm_overlap:
-            assert (
-                tex.userbuf_comm_available()
-            ), "Userbuffer communication backend not available."
 
         self.self_attn_mask_type = self_attn_mask_type
         self.window_size = window_size
@@ -289,16 +283,14 @@ class TransformerLayer(torch.nn.Module):
         self.layer_number = layer_number
         self.output_layernorm = output_layernorm
         self.layer_type = layer_type
-        self.apply_residual_connection_post_layernorm = (
-            apply_residual_connection_post_layernorm
-        )
+        self.apply_residual_connection_post_layernorm = apply_residual_connection_post_layernorm
 
         if parallel_attention_mlp:
             assert self.layer_type == "encoder", "parallel_attention requires layer_type='encoder'"
-            assert (
-                not self.apply_residual_connection_post_layernorm
-            ), "parallel_attention and apply_residual_connection_post_layernorm "\
-               "not supported simultaneously."
+            assert not self.apply_residual_connection_post_layernorm, (
+                "parallel_attention and apply_residual_connection_post_layernorm "
+                "not supported simultaneously."
+            )
             assert (
                 not self.output_layernorm
             ), "parallel_attention and output_layernorm not supported simultaneously"
@@ -315,9 +307,7 @@ class TransformerLayer(torch.nn.Module):
         if not fuse_qkv_params:
             qkv_weight_interleaved = False
 
-        self.kv_channels = (
-            kv_channels if kv_channels else (hidden_size // num_attention_heads)
-        )
+        self.kv_channels = kv_channels if kv_channels else (hidden_size // num_attention_heads)
 
         if init_method is None:
             init_method = get_default_init_method()
@@ -354,13 +344,13 @@ class TransformerLayer(torch.nn.Module):
             "set_parallel_mode": set_parallel_mode,
             "fuse_qkv_params": fuse_qkv_params,
             "zero_centered_gamma": zero_centered_gamma,
-            "qkv_weight_interleaved" : qkv_weight_interleaved,
-            "ub_bulk_wgrad" : ub_bulk_wgrad,
-            "ub_bulk_dgrad" : ub_bulk_dgrad,
-            "ub_overlap_ag" : ub_overlap_ag,
-            "ub_overlap_rs" : ub_overlap_rs,
-            "ub_overlap_rs_dgrad" : ub_overlap_rs_dgrad,
-            "qkv_format" : self.attn_input_format,
+            "qkv_weight_interleaved": qkv_weight_interleaved,
+            "ub_bulk_wgrad": ub_bulk_wgrad,
+            "ub_bulk_dgrad": ub_bulk_dgrad,
+            "ub_overlap_ag": ub_overlap_ag,
+            "ub_overlap_rs": ub_overlap_rs,
+            "ub_overlap_rs_dgrad": ub_overlap_rs_dgrad,
+            "qkv_format": self.attn_input_format,
         }
 
         self.self_attention = MultiheadAttention(
@@ -429,22 +419,18 @@ class TransformerLayer(torch.nn.Module):
         TORCH_MAJOR = int(torch.__version__.split(".")[0])
         TORCH_MINOR = int(torch.__version__.split(".")[1])
         use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
-        self.bias_dropout_add_exec_handler = (
-            nullcontext if use_nvfuser else torch.enable_grad
-        )
+        self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
 
         if self.bias_dropout_fusion:
             set_jit_fusion_options()
             if seq_length and micro_batch_size:
                 if self.sequence_parallel:
                     seq_length = seq_length // self.tp_size
-                warmup_jit_bias_dropout_add_all_dtypes(
-                    hidden_size, seq_length, micro_batch_size
-                )
+                warmup_jit_bias_dropout_add_all_dtypes(hidden_size, seq_length, micro_batch_size)
 
         norm_module = {
-                "LayerNorm": LayerNorm,
-                "RMSNorm": RMSNorm,
+            "LayerNorm": LayerNorm,
+            "RMSNorm": RMSNorm,
         }
         if self.output_layernorm:
             self.layernorm = norm_module[normalization](
@@ -472,6 +458,15 @@ class TransformerLayer(torch.nn.Module):
                 continue
             if hasattr(child, "set_tensor_parallel_group"):
                 child.set_tensor_parallel_group(tp_group)
+
+    def reset_fp8_meta_tensors(self) -> None:
+        """Set TP group"""
+        # Deep iterate but skip self to avoid infinite recursion.
+        for index, child in enumerate(self.modules()):
+            if index == 0:
+                continue
+            if hasattr(child, "reset_fp8_meta_tensors"):
+                child.reset_fp8_meta_tensors()
 
     def set_context_parallel_group(
         self,
@@ -533,6 +528,8 @@ class TransformerLayer(torch.nn.Module):
                         It should be in [batch_size, 1, 1, seqlen_q] for 'padding' mask,
                         and broadcastable to [batch_size, num_heads, max_seqlen_q, max_seqlen_kv]
                         for 'arbitrary'. It should be 'None' for 'causal' and 'no_mask'.
+                        A `True` value means the corresponding position is masked out and
+                        a `False` means that position is allowed to participate in attention.
         self_attn_mask_type: {'no_mask', 'causal', 'padding', 'padding_causal', 'arbitrary'},
                             default = `causal`
                             Type of attention mask passed into softmax operation.
@@ -546,7 +543,9 @@ class TransformerLayer(torch.nn.Module):
              using `layer_type="decoder"`. It should be a tuple of two masks in
              [batch_size, 1, 1, seqlen_q] and [batch_size, 1, 1, seqlen_kv] for 'padding' mask.
              It should be broadcastable to [batch_size, num_heads, max_seqlen_q, max_seqlen_kv]
-             for 'arbitrary' mask. It should be 'None' for 'causal' and 'no_mask'.
+             for 'arbitrary' mask. It should be 'None' for 'causal' and 'no_mask'. A `True` value
+             means the corresponding position is masked out and a `False` means that position is
+             allowed to participate in attention.
         is_first_microbatch : {True, False, None}, default = None
                              During training using either gradient accumulation or
                              pipeline parallelism a minibatch of data is further split
@@ -601,18 +600,14 @@ class TransformerLayer(torch.nn.Module):
                 hidden_states.shape[0] == self.seq_length // self.tp_size
             ), "Sequence dimension must be split across TP group when using sequence parallel."
 
-        if (("padding" in self_attn_mask_type
-            or self_attn_mask_type == "arbitrary")
-            and attention_mask is not None):
-            assert (
-                attention_mask.dtype == torch.bool
-            ), "Attention mask must be a boolean tensor"
+        if (
+            "padding" in self_attn_mask_type or self_attn_mask_type == "arbitrary"
+        ) and attention_mask is not None:
+            assert attention_mask.dtype == torch.bool, "Attention mask must be a boolean tensor"
 
         # For AMP
         if torch.is_autocast_enabled():
-            hidden_states = cast_if_needed(
-                hidden_states, torch.get_autocast_gpu_dtype()
-            )
+            hidden_states = cast_if_needed(hidden_states, torch.get_autocast_gpu_dtype())
 
         # Self attention.
         self_attention_outputs = self.self_attention(
@@ -646,7 +641,6 @@ class TransformerLayer(torch.nn.Module):
             inter_attention_outputs = self.inter_attention(
                 hidden_states,
                 attention_mask=enc_dec_attn_mask,
-                window_size=window_size,
                 encoder_output=encoder_output,
                 is_first_microbatch=is_first_microbatch,
                 checkpoint_core_attention=checkpoint_core_attention,
@@ -665,7 +659,8 @@ class TransformerLayer(torch.nn.Module):
 
         # MLP.
         mlp_outputs = self.layernorm_mlp(
-            hidden_states, is_first_microbatch=is_first_microbatch
+            hidden_states,
+            is_first_microbatch=is_first_microbatch,
         )
         if self.apply_residual_connection_post_layernorm:
             mlp_output, mlp_bias, residual = mlp_outputs
@@ -696,9 +691,7 @@ class TransformerLayer(torch.nn.Module):
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
 
             with self.bias_dropout_add_exec_handler():
-                output = bias_dropout_add_func(
-                    hidden_state, bias, residual, self.hidden_dropout
-                )
+                output = bias_dropout_add_func(hidden_state, bias, residual, self.hidden_dropout)
         else:
             if bias.numel() != 0:
                 hidden_state = hidden_state + bias
