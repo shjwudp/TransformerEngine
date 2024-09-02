@@ -324,6 +324,7 @@ at::Tensor te_gemm_ts(at::Tensor A,
 
   const int sm_count = transformer_engine::cuda::sm_count();
   int num_math_sms = sm_count - transformer_engine::getenv<int>("NVTE_EXT_MARGIN_SM", sm_count);
+  prinf("te_gemm_ts.num_math_sms: %d\n", num_math_sms);
 
   if (A_scale_inverse.numel())
     A_scale_inverse = A_scale_inverse[A_fp8_tensor];
