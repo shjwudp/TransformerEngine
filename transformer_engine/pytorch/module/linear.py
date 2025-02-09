@@ -97,6 +97,7 @@ class _Linear(torch.autograd.Function):
         fsdp_group: Union[dist_group_type, None],
         module: torch.nn.Module,
         skip_fp8_weight_update: bool,
+        accumulate_wgrad_into_param_main_grad: Union[bool, None],
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
 
@@ -267,6 +268,7 @@ class _Linear(torch.autograd.Function):
             ctx.grad_output_quantizer = grad_output_quantizer
             ctx.grad_input_quantizer = grad_input_quantizer
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.accumulate_wgrad_into_param_main_grad = accumulate_wgrad_into_param_main_grad
             if fuse_wgrad_accumulation and weight.requires_grad:
                 ctx.main_grad = weight.main_grad
 
@@ -434,7 +436,9 @@ class _Linear(torch.autograd.Function):
                 inputmat_total = inputmat
 
             # Check whether to output wgrad GEMM directly into main grad
-            if ctx.is_first_microbatch is not None:
+            if ctx.accumulate_wgrad_into_param_main_grad:
+                accumulate_wgrad_into_param_main_grad = ctx.accumulate_wgrad_into_param_main_grad
+            elif ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
                     ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
                 )
@@ -620,6 +624,7 @@ class _Linear(torch.autograd.Function):
             None,  # fsdp_group
             None,  # module
             None,  # skip_fp8_weight_update
+            None,  # accumulate_wgrad_into_param_main_grad
         )
 
 
@@ -939,6 +944,7 @@ class Linear(TransformerEngineBaseModule):
         is_first_microbatch: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
         fp8_grad: Optional[bool] = False,
+        accumulate_wgrad_into_param_main_grad: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply the linear transformation to the input.
@@ -1041,6 +1047,7 @@ class Linear(TransformerEngineBaseModule):
                 self.fsdp_group,
                 self,
                 skip_fp8_weight_update,
+                accumulate_wgrad_into_param_main_grad,
             )
             out = linear_fn(*args)
         if self.gemm_bias_unfused_add:

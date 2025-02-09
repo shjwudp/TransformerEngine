@@ -76,6 +76,7 @@ class _GroupedLinear(torch.autograd.Function):
         is_grad_enabled: bool,
         module,
         skip_fp8_weight_update,
+        accumulate_wgrad_into_param_main_grad,
         *weights_and_biases,
     ) -> torch.Tensor:
 
@@ -195,6 +196,9 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.activation_dtype = activation_dtype
             ctx.fp8 = fp8
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.accumulate_wgrad_into_param_main_grad = accumulate_wgrad_into_param_main_grad
+            if fuse_wgrad_accumulation:
+                ctx.main_grads = [w.main_grad for w in weights]
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
             ctx.use_bias = use_bias
@@ -228,6 +232,10 @@ class _GroupedLinear(torch.autograd.Function):
                     w.main_grad = main_grads[i]
                     weights[i] = w
 
+            if ctx.fuse_wgrad_accumulation:
+                for w, main_grad in zip(weights, ctx.main_grads):
+                    w.main_grad = main_grad
+
             # preprocess grad_output
 
             grad_output = grad_output.contiguous()
@@ -252,7 +260,9 @@ class _GroupedLinear(torch.autograd.Function):
             else:
                 grad_output = grad_output_mats
 
-            if ctx.is_first_microbatch is not None:
+            if ctx.accumulate_wgrad_into_param_main_grad is not None:
+                accumulate_wgrad_into_param_main_grad = ctx.accumulate_wgrad_into_param_main_grad
+            elif ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
                     ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
                 )
@@ -321,12 +331,7 @@ class _GroupedLinear(torch.autograd.Function):
                                     requires_grad=False,
                                 )
                             else:
-                                wgrad = torch.empty(
-                                    w.main_grad.shape,
-                                    dtype=w.dtype,
-                                    device=torch.cuda.current_device(),
-                                    requires_grad=False,
-                                )
+                                wgrad = None
                         elif ctx.fuse_wgrad_accumulation:
                             wgrad = None
                     else:
@@ -362,6 +367,7 @@ class _GroupedLinear(torch.autograd.Function):
             None,
             None,  # is_grad_enabled
             None,  # is_grad_enabled
+            None,  # accumulate_wgrad_into_param_main_grad
             *wgrad_list,
             *grad_biases,
         )
@@ -553,6 +559,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         inp: torch.Tensor,
         m_splits: List[int],
         is_first_microbatch: Optional[bool] = None,
+        accumulate_wgrad_into_param_main_grad: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply the linear transformation to the input.
@@ -646,6 +653,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 torch.is_grad_enabled(),
                 self,
                 skip_fp8_weight_update,
+                accumulate_wgrad_into_param_main_grad,
                 *weight_tensors,
                 *bias_tensors,
             )
