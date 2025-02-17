@@ -233,9 +233,7 @@ class _GroupedLinear(torch.autograd.Function):
                     weights[i] = w
 
             if ctx.fuse_wgrad_accumulation:
-                for w, main_grad, inp_ntokens in zip(weights, ctx.main_grads, ctx.m_splits):
-                    if inp_ntokens == 0:
-                        main_grad.zero_()
+                for w, main_grad in zip(weights, ctx.main_grads):
                     w.main_grad = main_grad
 
             # preprocess grad_output
