@@ -233,7 +233,9 @@ class _GroupedLinear(torch.autograd.Function):
                     weights[i] = w
 
             if ctx.fuse_wgrad_accumulation:
-                for w, main_grad in zip(weights, ctx.main_grads):
+                for w, main_grad, inp_ntokens in zip(weights, ctx.main_grads, ctx.m_splits):
+                    if inp_ntokens == 0:
+                        main_grad.zero_()
                     w.main_grad = main_grad
 
             # preprocess grad_output
@@ -296,25 +298,25 @@ class _GroupedLinear(torch.autograd.Function):
                         torch.empty(w.size(), dtype=ctx.activation_dtype, device=ctx.device)
                         for w in weights
                     ]
-                    # WGRAD
-                    _, grad_biases_, _ = general_grouped_gemm(
-                        inputmats,
-                        grad_output,
-                        wgrad_list,
-                        ctx.activation_dtype,
-                        get_multi_stream_cublas_workspace(),
-                        layout="NT",
-                        grad=True,
-                        m_splits=ctx.m_splits,
-                        use_bias=ctx.use_bias if grad_biases[0] is None else None,
-                        bias=biases,
-                        use_split_accumulator=_2X_ACC_WGRAD,
-                        accumulate=accumulate_wgrad_into_param_main_grad,
-                    )
-                    for i in range(ctx.num_gemms):
-                        if grad_biases[i] is None:
-                            grad_biases[i] = grad_biases_[i]
-                    del grad_biases_
+                # WGRAD
+                _, grad_biases_, _ = general_grouped_gemm(
+                    inputmats,
+                    grad_output,
+                    wgrad_list,
+                    ctx.activation_dtype,
+                    get_multi_stream_cublas_workspace(),
+                    layout="NT",
+                    grad=True,
+                    m_splits=ctx.m_splits,
+                    use_bias=ctx.use_bias if grad_biases[0] is None else None,
+                    bias=biases,
+                    use_split_accumulator=_2X_ACC_WGRAD,
+                    accumulate=accumulate_wgrad_into_param_main_grad,
+                )
+                for i in range(ctx.num_gemms):
+                    if grad_biases[i] is None:
+                        grad_biases[i] = grad_biases_[i]
+                del grad_biases_
 
                 # Deallocate input tensor
                 clear_tensor_data(*inputmats)
