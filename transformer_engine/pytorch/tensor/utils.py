@@ -65,7 +65,10 @@ def cast_master_weights_to_fp8(model_weights, master_weights, start_offsets, gro
     current_scaling_params = []
 
     if fsdp_shard_model_weights is None:
+        use_fsdp_shard_model_weights = False
         fsdp_shard_model_weights = [None] * len(model_weights)
+    else:
+        use_fsdp_shard_model_weights = True
 
     for model_weight, master_weight, start_offset, fsdp_shard_model_weight in zip(
         model_weights, master_weights, start_offsets, fsdp_shard_model_weights
@@ -107,9 +110,9 @@ def cast_master_weights_to_fp8(model_weights, master_weights, start_offsets, gro
             )
 
     if len(delayed_scaling_params) > 0:
-        _cast_master_weights_to_fp8_delayed_scaling(delayed_scaling_params, group)
+        _cast_master_weights_to_fp8_delayed_scaling(delayed_scaling_params, group, use_fsdp_shard_model_weights)
     if len(current_scaling_params) > 0:
-        _cast_master_weights_to_fp8_current_scaling(current_scaling_params, group)
+        _cast_master_weights_to_fp8_current_scaling(current_scaling_params, group, use_fsdp_shard_model_weights)
 
 
 def _cast_master_weights_to_fp8_delayed_scaling(params, group, use_fsdp_shard_model_weights=False):
